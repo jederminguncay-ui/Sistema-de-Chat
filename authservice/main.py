@@ -1,17 +1,17 @@
-from fastapi import FastAPI, HTTPException
+import os
+
+from dotenv import load_dotenv
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlmodel import SQLModel, create_engine, Session, select
-from pydantic import BaseModel
-import base64
+from fastapi.staticfiles import StaticFiles
 
-from models.user import User
-from routes.auth import hash_password, verify_password
+load_dotenv()
 
-app = FastAPI()
+from database.db import create_db_and_tables  # noqa: E402
+from routes.auth import router as auth_router  # noqa: E402
 
-# =========================
-# 🔥 CORS (ARREGLA ERROR OPTIONS 405)
-# =========================
+app = FastAPI(title="Sistema de Chat - Auth Service", version="1.0.0")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,32 +20,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
-# DB
-# =========================
-engine = create_engine("sqlite:///database.db")
-SQLModel.metadata.create_all(engine)
 
-active_tokens = {}
-
-# =========================
-# MODELOS
-# =========================
-class LoginRequest(BaseModel):
-    username: str
-    password: str
+@app.on_event("startup")
+def on_startup() -> None:
+    """Crea la base de datos y las tablas si no existen."""
+    create_db_and_tables()
 
 
-class RegisterRequest(BaseModel):
-    username: str
-    password: str
+@app.get("/health")
+def health() -> dict:
+    """Endpoint simple para verificar que el servicio está activo."""
+    return {"status": "ok", "service": "authservice"}
 
-# =========================
-# REGISTER (FIXED)
-# =========================
-@app.post("/register")
-def register(data: RegisterRequest):
+app.include_router(auth_router)
 
+<<<<<<< HEAD
     if not data.username.strip():
         raise HTTPException(
             status_code=400,
@@ -135,3 +124,9 @@ def logout(token: str):
 
     return {"message": "Sesión cerrada"}
     
+=======
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_CLIENT_DIR = os.getenv("CLIENT_DIR") or os.path.join(_BASE_DIR, "..", "cliente")
+if os.path.isdir(_CLIENT_DIR):
+    app.mount("/", StaticFiles(directory=_CLIENT_DIR, html=True), name="cliente")
+>>>>>>> 5b64070bc752a27436172e15cbe32d2ca1eb1f1c

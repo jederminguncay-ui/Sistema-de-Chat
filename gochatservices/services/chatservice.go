@@ -1,55 +1,122 @@
 package services
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
 	"sync"
+	"time"
 
-	"github.com/gorilla/websocket"
+	"SistemadeChat/gochatservices/models"
 )
 
-type ChatService struct {
-	Clients map[*websocket.Conn]bool
-	Mutex   sync.Mutex
+type Client struct {
+	UserID int
+	Token  string
+	Send   chan []byte
 }
 
-func NewChatService() *ChatService {
-	return &ChatService{
-		Clients: make(map[*websocket.Conn]bool),
+type Hub struct {
+	clients map[int]*Client
+	mu      sync.RWMutex
+	authURL string
+	http    *http.Client
+}
+
+func NewHub(authURL string) *Hub {
+	return &Hub{
+		clients: make(map[int]*Client),
+		authURL: authURL,
+		http:    &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
-// agregar cliente
-func (c *ChatService) AddClient(conn *websocket.Conn) {
-	c.Mutex.Lock()
-	defer c.Mutex.Unlock()
-
-	c.Clients[conn] = true
+func (h *Hub) Register(c *Client) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if old, ok := h.clients[c.UserID]; ok {
+		close(old.Send)
+	}
+	h.clients[c.UserID] = c
 }
 
-// eliminar cliente
-func (c *ChatService) RemoveClient(conn *websocket.Conn) {
-	c.Mutex.Lock()
-	defer c.Mutex.Unlock()
-
-	delete(c.Clients, conn)
-	conn.Close()
+func (h *Hub) Unregister(c *Client) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if current, ok := h.clients[c.UserID]; ok && current == c {
+		delete(h.clients, c.UserID)
+		close(c.Send)
+	}
 }
 
-// enviar mensaje a todos (JSON seguro)
-func (c *ChatService) BroadcastJSON(msg interface{}) {
-	data, err := json.Marshal(msg)
+func (h *Hub) IsOnline(userID int) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	_, ok := h.clients[userID]
+	return ok
+}
+
+func (h *Hub) SendToUser(userID int, payload []byte) bool {
+	h.mu.RLock()
+	client, ok := h.clients[userID]
+	h.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	select {
+	case client.Send <- payload:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Hub) PersistMessage(token string, req models.SendRequest) (*models.SavedMessage, error) {
+	body, err := json.Marshal(req)
 	if err != nil {
-		return
+		return nil, err
 	}
 
-	c.Mutex.Lock()
-	defer c.Mutex.Unlock()
-
-	for client := range c.Clients {
-		err := client.WriteMessage(websocket.TextMessage, data)
-		if err != nil {
-			client.Close()
-			delete(c.Clients, client)
-		}
+	httpReq, err := http.NewRequest(
+		http.MethodPost, h.authURL+"/message/send", bytes.NewReader(body),
+	)
+	if err != nil {
+		return nil, err
 	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+
+	return h.doMessageRequest(httpReq)
+}
+
+func (h *Hub) MarkRead(token string, messageID int) (*models.SavedMessage, error) {
+	url := fmt.Sprintf("%s/message/read/%d", h.authURL, messageID)
+	httpReq, err := http.NewRequest(http.MethodPut, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+
+	return h.doMessageRequest(httpReq)
+}
+
+func (h *Hub) doMessageRequest(req *http.Request) (*models.SavedMessage, error) {
+	resp, err := h.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("authservice respondió %d: %s", resp.StatusCode, string(data))
+	}
+
+	var saved models.SavedMessage
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return nil, err
+	}
+	return &saved, nil
 }

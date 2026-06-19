@@ -2,106 +2,198 @@ package handlers
 
 import (
 	"encoding/json"
-	"fmt"
-	"io"
+	"log"
 	"net/http"
-	"net/url"
-
-	"SistemadeChat/gochatservices/services"
+	"time"
 
 	"github.com/gorilla/websocket"
+
+	"SistemadeChat/gochatservices/models"
+	"SistemadeChat/gochatservices/services"
+	"SistemadeChat/gochatservices/utils"
 )
 
-var chatService = services.NewChatService()
+const (
+	writeWait      = 10 * time.Second
+	pongWait       = 60 * time.Second
+	pingPeriod     = (pongWait * 9) / 10
+	maxMessageSize = 8192
+	sendBuffer     = 32
+)
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
-type VerifyResponse struct {
-	Valid    bool   `json:"valid"`
-	Username string `json:"username"`
+type wsClient struct {
+	conn *websocket.Conn
+	hub  *services.Hub
+	base *services.Client
 }
 
-func verifyToken(token string) (string, bool) {
-	apiURL := "http://localhost:8000/verify-token?token=" + url.QueryEscape(token)
+func ServeWS(hub *services.Hub, cfg *utils.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := r.URL.Query().Get("token")
+		userID, _, err := utils.ValidateToken(token, cfg.SecretKey)
+		if err != nil {
+			http.Error(w, "no autorizado: "+err.Error(), http.StatusUnauthorized)
+			return
+		}
 
-	resp, err := http.Get(apiURL)
-	if err != nil {
-		return "", false
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("error al actualizar a WebSocket: %v", err)
+			return
+		}
+
+		base := &services.Client{
+			UserID: userID,
+			Token:  token,
+			Send:   make(chan []byte, sendBuffer),
+		}
+		client := &wsClient{conn: conn, hub: hub, base: base}
+		hub.Register(base)
+		log.Printf("usuario %d conectado", userID)
+
+		go client.writePump()
+		client.readPump()
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return "", false
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", false
-	}
-
-	var result VerifyResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", false
-	}
-
-	return result.Username, result.Valid
 }
-func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
-	// 1. obtener token
-	token := r.URL.Query().Get("token")
-
-	if token == "" {
-		http.Error(w, "Token requerido", http.StatusUnauthorized)
-		return
-	}
-
-	// 2. validar token contra FastAPI
-	username, valid := verifyToken(token)
-	if !valid {
-		http.Error(w, "Token inválido", http.StatusUnauthorized)
-		return
-	}
-
-	// 3. upgrade a websocket
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		fmt.Println("Error websocket:", err)
-		return
-	}
-
-	// 4. agregar cliente
-	chatService.AddClient(conn)
-
-	fmt.Println("Usuario conectado:", username)
-	fmt.Println("Clientes conectados:", len(chatService.Clients))
-
-	// 5. cleanup
+func (c *wsClient) readPump() {
 	defer func() {
-		chatService.RemoveClient(conn)
-		fmt.Println("Usuario desconectado:", username)
+		c.hub.Unregister(c.base)
+		_ = c.conn.Close()
+		log.Printf("usuario %d desconectado", c.base.UserID)
 	}()
 
-	// 6. loop de mensajes
+	c.conn.SetReadLimit(maxMessageSize)
+	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
 	for {
-		_, message, err := conn.ReadMessage()
+		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
+			if websocket.IsUnexpectedCloseError(
+				err, websocket.CloseGoingAway, websocket.CloseNormalClosure,
+			) {
+				log.Printf("error de lectura (usuario %d): %v", c.base.UserID, err)
+			}
 			break
 		}
 
-		fmt.Println(username+":", string(message))
-
-		// 7. mensaje estructurado (IMPORTANTE)
-		msg := map[string]string{
-			"user": username,
-			"text": string(message),
+		var frame models.ClientFrame
+		if err := json.Unmarshal(raw, &frame); err != nil {
+			c.sendError("formato de mensaje inválido")
+			continue
 		}
 
-		// 8. broadcast correcto
-		chatService.BroadcastJSON(msg)
+		switch frame.Type {
+		case "send":
+			c.handleSend(frame)
+		case "read":
+			c.handleRead(frame)
+		default:
+			c.sendError("tipo de mensaje no soportado")
+		}
+	}
+}
+
+func (c *wsClient) handleSend(frame models.ClientFrame) {
+	receiverOnline := c.hub.IsOnline(frame.ReceiverID)
+
+	saved, err := c.hub.PersistMessage(c.base.Token, models.SendRequest{
+		ConversationID: frame.ConversationID,
+		ReceiverID:     frame.ReceiverID,
+		Content:        frame.Content,
+		Delivered:      receiverOnline,
+	})
+	if err != nil {
+		log.Printf("error al guardar mensaje: %v", err)
+		c.sendError("no se pudo guardar el mensaje")
+		return
+	}
+
+	ack, _ := json.Marshal(models.ServerFrame{
+		Type:           "sent",
+		TempID:         frame.TempID,
+		ID:             saved.ID,
+		ConversationID: saved.ConversationID,
+		SenderID:       saved.SenderID,
+		ReceiverID:     saved.ReceiverID,
+		CreatedAt:      saved.CreatedAt,
+		Delivered:      saved.Delivered,
+		Read:           saved.Read,
+	})
+	c.base.Send <- ack
+
+	if receiverOnline {
+		incoming, _ := json.Marshal(models.ServerFrame{
+			Type:           "message",
+			ID:             saved.ID,
+			ConversationID: saved.ConversationID,
+			SenderID:       saved.SenderID,
+			ReceiverID:     saved.ReceiverID,
+			Content:        saved.Content,
+			CreatedAt:      saved.CreatedAt,
+			Delivered:      true,
+			Read:           false,
+		})
+		c.hub.SendToUser(frame.ReceiverID, incoming)
+	}
+}
+
+func (c *wsClient) handleRead(frame models.ClientFrame) {
+	for _, id := range frame.MessageIDs {
+		saved, err := c.hub.MarkRead(c.base.Token, id)
+		if err != nil {
+			log.Printf("error al marcar leído (mensaje %d): %v", id, err)
+			continue
+		}
+		notice, _ := json.Marshal(models.ServerFrame{
+			Type:           "read",
+			ID:             saved.ID,
+			ConversationID: saved.ConversationID,
+		})
+		c.hub.SendToUser(saved.SenderID, notice)
+	}
+}
+
+func (c *wsClient) sendError(detail string) {
+	payload, _ := json.Marshal(models.ServerFrame{Type: "error", Detail: detail})
+	select {
+	case c.base.Send <- payload:
+	default:
+	}
+}
+
+func (c *wsClient) writePump() {
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		_ = c.conn.Close()
+	}()
+
+	for {
+		select {
+		case message, ok := <-c.base.Send:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				return
+			}
+		case <-ticker.C:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
 	}
 }

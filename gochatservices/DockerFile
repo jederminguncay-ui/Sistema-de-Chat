@@ -1,11 +1,11 @@
-FROM golang:1.24
-
+FROM golang:1.26-alpine AS builder
 WORKDIR /app
-
-COPY . .
-
-RUN go mod tidy
-
-RUN go build -o chatserver .
-
-CMD ["./chatserver"]
+COPY go.mod go.sum ./
+RUN go mod download
+COPY gochatservices ./gochatservices
+RUN CGO_ENABLED=0 GOOS=linux go build -o /chat-server ./gochatservices
+FROM alpine:3.20
+WORKDIR /app
+COPY --from=builder /chat-server /app/chat-server
+EXPOSE 8080
+CMD ["/app/chat-server"]

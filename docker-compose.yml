@@ -1,0 +1,32 @@
+services:
+  authservice:
+    build:
+      context: .
+      dockerfile: authservice/Dockerfile
+    container_name: chat_authservice
+    env_file:
+      - ./authservice/.env
+    environment:
+      DATABASE_URL: sqlite:////data/chat.db
+    ports:
+      - "8000:8000"
+    volumes:
+      - chat_data:/data
+    restart: unless-stopped
+  gochatservices:
+    build:
+      context: .
+      dockerfile: gochatservices/Dockerfile
+    container_name: chat_gochatservices
+    env_file:
+      - ./authservice/.env
+    environment:
+      PORT: "8080"
+      AUTH_SERVICE_URL: http://authservice:8000
+    ports:
+      - "8080:8080"
+    depends_on:
+      - authservice
+    restart: unless-stopped
+volumes:
+  chat_data:
