@@ -134,3 +134,4 @@ def logout(token: str):
         del active_tokens[token]
 
     return {"message": "Sesión cerrada"}
+    
